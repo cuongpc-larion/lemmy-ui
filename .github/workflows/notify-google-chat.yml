@@ -1,0 +1,94 @@
+# Posts to Google Chat on pushes to feature/hotfix branches and on merged PRs.
+# Copy this file unchanged into ea-fe and ea-mobile.
+#
+# Setup (Settings > Secrets and variables > Actions):
+#   secret   GOOGLE_CHAT_WEBHOOK   incoming webhook URL of the Google Chat space (required)
+#   variable JIRA_BASE_URL         for example https://yourorg.atlassian.net (optional)
+#
+# Pushes to main and staging are not listed: they only happen through merged PRs, which are reported below.
+# Pushes to wip/**, merge/** and revert/** are silent on purpose.
+# A push that lands a merged PR is skipped: the pull_request event already reports it.
+
+name: Notify Google Chat
+
+on:
+  push:
+    branches: ['feat/**', 'hotfix/**']
+  pull_request:
+    types: [closed]
+    branches: [main, staging, 'feat/**']
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push' && !github.event.deleted) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged)
+    steps:
+      - name: Send message
+        env:
+          WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "::warning::GOOGLE_CHAT_WEBHOOK is not set, skipping notification"
+            exit 0
+          fi
+
+          # Read everything from the event file with jq, so branch names and commit
+          # messages are never interpolated into the shell script.
+          ev="$GITHUB_EVENT_PATH"
+          repo="${GITHUB_REPOSITORY#*/}"
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            branch="$GITHUB_REF_NAME"
+            sha=$(jq -r '.after' "$ev")
+
+            # Merging a PR into feat/** also pushes to it. The pull_request event reports that merge,
+            # so skip the push when its head commit belongs to a PR merged into this branch.
+            merged_pr=$( { gh api "repos/$GITHUB_REPOSITORY/commits/$sha/pulls" 2>/dev/null || echo '[]'; } \
+              | jq --arg branch "$branch" '[.[] | select(.merged_at != null and .base.ref == $branch)] | length')
+            if [ "${merged_pr:-0}" != "0" ]; then
+              echo "Push comes from a merged PR, already reported by the pull_request event"
+              exit 0
+            fi
+
+            # Pick the message for the kind of push:
+            #   new branch      "created <branch>" (plus new commits, if any)
+            #   merge of main   "merged main into <branch>", without listing main's released commits
+            #   anything else   "pushed N commit(s)", counting only commits new to the repo (distinct)
+            text=$(jq -r --arg repo "$repo" --arg branch "$branch" '
+              ((.head_commit.message // "") | split("\n")[0]) as $msg
+              | ([.commits[] | select(.distinct)] | length) as $n
+              | if .created then
+                  "*[\($repo)]* \(.pusher.name) created `\($branch)`"
+                  + (if $n > 0 then " with \($n) new commit(s)\n> \($msg)" else "" end)
+                elif ($msg | test("^Merge (remote-tracking )?branch \u0027(origin/)?main\u0027")) then
+                  "*[\($repo)]* \(.pusher.name) merged `main` into `\($branch)`\n" + .compare
+                else
+                  "*[\($repo)]* \(.pusher.name) pushed \($n) commit(s) to `\($branch)`\n"
+                  + "> \($msg)\n" + .compare
+                end' "$ev")
+          else
+            branch=$(jq -r '.pull_request.head.ref' "$ev")
+            text=$(jq -r --arg repo "$repo" '
+              "*[\($repo)]* PR #\(.pull_request.number) merged: \(.pull_request.title)\n"
+              + "`\(.pull_request.head.ref)` -> `\(.pull_request.base.ref)` by \(.pull_request.merged_by.login)\n"
+              + .pull_request.html_url' "$ev")
+          fi
+
+          key=$(printf '%s' "$branch" | grep -oE '[A-Z][A-Z0-9]+-[0-9]+' | head -n 1 || true)
+          if [ -n "$key" ] && [ -n "${JIRA_BASE_URL:-}" ]; then
+            text="$text"$'\n'"Jira: ${JIRA_BASE_URL%/}/browse/$key"
+          fi
+
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json; charset=UTF-8' --data @- "$WEBHOOK" \
+            > /dev/null
+          echo "Notification sent"
